@@ -16,7 +16,11 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
+    int ret = system(cmd);
+    
+    if (ret == -1) {
+        return false;
+    }
     return true;
 }
 
@@ -45,10 +49,6 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
 /*
  * TODO:
  *   Execute a system command by calling fork, execv(),
@@ -61,7 +61,18 @@ bool do_exec(int count, ...)
 
     va_end(args);
 
-    return true;
+    pid_t pid = fork();
+
+    if ( pid == 0 ){
+        execv(command[0], command);
+        _exit(1);
+    }
+    
+    int status;
+    if  (waitpid(pid, &status, 0) == -1) {
+        return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 /**
@@ -80,10 +91,6 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
 
 /*
  * TODO
@@ -92,8 +99,31 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
-
     va_end(args);
 
-    return true;
+    pid_t pid = fork();
+    if ( pid == -1 ) {
+        return false;
+    }
+
+    if ( pid == 0) {
+        int fd = open(outputfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) { 
+            _exit(1);
+        }
+        if (dup2(fd, 1) < 0) { 
+            close(fd);
+            _exit(1);
+        }
+        close(fd);
+        execv(command[0], command);
+        _exit(1);
+    }
+    
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        return false;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
