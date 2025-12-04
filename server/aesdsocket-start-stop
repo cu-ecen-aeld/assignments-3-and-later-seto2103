@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/bin/sh
 
-DAEMON=/use/bin/aesdsocket
+DAEMON=/usr/bin/aesdsocket
 DAEMON_OPTS="-d"
 
 # PID file to track the daemon
