@@ -5,31 +5,51 @@
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/queue.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <syslog.h>
+#include <pthread.h>
 
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
+#define TIMESTAMP_INTERVAL_SECONDS 10
 
-int exit_requested = 0;
+volatile sig_atomic_t exit_requested = 0;
 int server_fd = -1;
-int client_fd = -1;
 
-void signal_handler()
+/* Protects all access (reads and writes) to DATA_FILE so that a write from
+ * one connection/timestamp thread is never interleaved with another. */
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct thread_node {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr_in client_addr;
+    volatile int thread_complete;
+    SLIST_ENTRY(thread_node) entries;
+};
+
+SLIST_HEAD(thread_list, thread_node);
+static struct thread_list head = SLIST_HEAD_INITIALIZER(head);
+
+void signal_handler(int signo)
 {
-    syslog(LOG_INFO, "Caught signal, exiting");
+    (void)signo;
     exit_requested = 1;
 
-    if (client_fd != -1) close(client_fd);
-    if (server_fd != -1) close(server_fd);
-
-    unlink(DATA_FILE);
+    /* Only async-signal-safe calls here: unblock the accept() loop by
+     * shutting down the listening socket. Per-connection cleanup and
+     * unlinking the data file happens in main() after threads are joined. */
+    if (server_fd != -1) {
+        shutdown(server_fd, SHUT_RDWR);
+    }
 }
 
-void setup_signals()
+void setup_signals(void)
 {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -40,7 +60,7 @@ void setup_signals()
     sigaction(SIGTERM, &sa, NULL);
 }
 
-void daemon_mode()
+void daemon_mode(void)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -65,9 +85,151 @@ void daemon_mode()
     freopen("/dev/null", "w", stderr);
 }
 
+static void write_all(int fd, const char *buf, size_t len)
+{
+    size_t written = 0;
+    while (written < len) {
+        ssize_t n = write(fd, buf + written, len - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        written += (size_t)n;
+    }
+}
+
+/* Writes packet to DATA_FILE and sends the file's full contents back to the
+ * client, holding file_mutex for the whole operation so no other thread's
+ * write or the timestamp thread can be interleaved with it. */
+static void append_packet_and_reply(const char *packet, size_t packet_len, int client_fd)
+{
+    char send_buf[1024];
+
+    pthread_mutex_lock(&file_mutex);
+
+    FILE *fp = fopen(DATA_FILE, "a+");
+    if (!fp) {
+        syslog(LOG_ERR, "fopen failed: %s", strerror(errno));
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+
+    fwrite(packet, 1, packet_len, fp);
+    fflush(fp);
+
+    fseek(fp, 0, SEEK_SET);
+    size_t n;
+    while ((n = fread(send_buf, 1, sizeof(send_buf), fp)) > 0) {
+        write_all(client_fd, send_buf, n);
+    }
+
+    fclose(fp);
+    pthread_mutex_unlock(&file_mutex);
+}
+
+static void *handle_connection(void *arg)
+{
+    struct thread_node *node = (struct thread_node *)arg;
+    int client_fd = node->client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &node->client_addr.sin_addr, client_ip, sizeof(client_ip));
+
+    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
+
+    char *recv_buffer = NULL;
+    size_t recv_buffer_size = 0;
+    char buf[1024];
+    ssize_t bytes;
+
+    while ((bytes = recv(client_fd, buf, sizeof(buf), 0)) > 0) {
+        for (ssize_t i = 0; i < bytes; i++) {
+            char c = buf[i];
+            char *tmp = realloc(recv_buffer, recv_buffer_size + 1);
+            if (!tmp) {
+                syslog(LOG_ERR, "realloc failed");
+                free(recv_buffer);
+                recv_buffer = NULL;
+                recv_buffer_size = 0;
+                continue;
+            }
+            recv_buffer = tmp;
+            recv_buffer[recv_buffer_size++] = c;
+
+            if (c == '\n') {
+                append_packet_and_reply(recv_buffer, recv_buffer_size, client_fd);
+                free(recv_buffer);
+                recv_buffer = NULL;
+                recv_buffer_size = 0;
+            }
+        }
+    }
+
+    free(recv_buffer);
+
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+
+    close(client_fd);
+    node->thread_complete = 1;
+    return NULL;
+}
+
+static void *timestamp_thread_func(void *arg)
+{
+    (void)arg;
+
+    while (!exit_requested) {
+        for (int i = 0; i < TIMESTAMP_INTERVAL_SECONDS && !exit_requested; i++) {
+            sleep(1);
+        }
+        if (exit_requested) break;
+
+        time_t now = time(NULL);
+        struct tm tm_info;
+        localtime_r(&now, &tm_info);
+
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%a, %d %b %Y %H:%M:%S %z", &tm_info);
+
+        char line[128];
+        int len = snprintf(line, sizeof(line), "timestamp:%s\n", timestamp);
+
+        pthread_mutex_lock(&file_mutex);
+        FILE *fp = fopen(DATA_FILE, "a");
+        if (fp) {
+            fwrite(line, 1, (size_t)len, fp);
+            fclose(fp);
+        } else {
+            syslog(LOG_ERR, "fopen failed for timestamp: %s", strerror(errno));
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    return NULL;
+}
+
+/* Joins and frees any connection threads that have finished, without
+ * blocking on ones still in progress. */
+static void reap_completed_threads(void)
+{
+    struct thread_node *node = SLIST_FIRST(&head);
+
+    while (node != NULL) {
+        struct thread_node *next = SLIST_NEXT(node, entries);
+
+        if (node->thread_complete) {
+            pthread_join(node->thread_id, NULL);
+            SLIST_REMOVE(&head, node, thread_node, entries);
+            free(node);
+        }
+
+        node = next;
+    }
+}
+
 int main(int argc, char *argv[])
 {
-    
+
     if (argc == 2 && strcmp(argv[1], "-d") == 0) {
         daemon_mode();
     }
@@ -99,79 +261,58 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+    pthread_t timestamp_tid;
+    pthread_create(&timestamp_tid, NULL, timestamp_thread_func, NULL);
+
     while (!exit_requested) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (errno == EINTR) continue; 
+            if (errno == EINTR) continue;
+            if (exit_requested) break;
             perror("accept");
             break;
         }
 
-        syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
-
-        FILE *fp = fopen(DATA_FILE, "a+");
-        if (!fp) {
-            perror("fopen");
+        struct thread_node *node = malloc(sizeof(struct thread_node));
+        if (!node) {
+            syslog(LOG_ERR, "malloc failed for connection node");
             close(client_fd);
-            client_fd = -1;
+            continue;
+        }
+        node->client_fd = client_fd;
+        node->client_addr = client_addr;
+        node->thread_complete = 0;
+
+        if (pthread_create(&node->thread_id, NULL, handle_connection, node) != 0) {
+            syslog(LOG_ERR, "pthread_create failed: %s", strerror(errno));
+            close(client_fd);
+            free(node);
             continue;
         }
 
-        char *recv_buffer = NULL;
-        size_t recv_buffer_size = 0;
-        char buf[1024];
-        ssize_t bytes;
+        SLIST_INSERT_HEAD(&head, node, entries);
 
-        int done = 0;
-        while ((bytes = read(client_fd, buf, sizeof(buf))) > 0) {
-            for (ssize_t i = 0; i < bytes; i++) {
-                char c = buf[i];
-                char *tmp = realloc(recv_buffer, recv_buffer_size + 1);
-                if (!tmp) {
-                    perror("realloc");
-                    free(recv_buffer);
-                    recv_buffer = NULL;
-                    recv_buffer_size = 0;
-                    break;
-                }
-                recv_buffer = tmp;
-                recv_buffer[recv_buffer_size++] = c;
-
-                if (c == '\n') {
-                    // Packet complete
-                    fwrite(recv_buffer, 1, recv_buffer_size, fp);
-                    fflush(fp);
-
-                    // Send full file back
-                    fseek(fp, 0, SEEK_SET);
-                    ssize_t n;
-                    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-                        write(client_fd, buf, n);
-                    }
-                    fseek(fp, 0, SEEK_END);
-
-                    free(recv_buffer);
-                    recv_buffer = NULL;
-                    recv_buffer_size = 0;
-                    done = 1;
-                    break;
-                }
-            }
-            if (done) {
-                break;
-            }
-        }
-
-        fclose(fp);
-
-        syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(client_addr.sin_addr));
-
-        close(client_fd);
-        client_fd = -1;
+        reap_completed_threads();
     }
+
+    /* Request exit from each still-running connection thread by shutting
+     * down its socket, which unblocks any thread waiting in recv(). */
+    struct thread_node *node;
+    SLIST_FOREACH(node, &head, entries) {
+        shutdown(node->client_fd, SHUT_RDWR);
+    }
+
+    while (!SLIST_EMPTY(&head)) {
+        node = SLIST_FIRST(&head);
+        pthread_join(node->thread_id, NULL);
+        SLIST_REMOVE_HEAD(&head, entries);
+        free(node);
+    }
+
+    pthread_join(timestamp_tid, NULL);
 
     if (server_fd != -1) {
         close(server_fd);

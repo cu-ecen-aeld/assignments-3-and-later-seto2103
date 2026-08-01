@@ -1,6 +1,6 @@
 CC = $(CROSS_COMPILE)gcc
 
-CFLAGS = -Wall -Wextra
+CFLAGS = -Wall -Wextra -pthread
 
 TARGET = aesdsocket
 
