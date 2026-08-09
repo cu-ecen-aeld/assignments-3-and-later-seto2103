@@ -14,9 +14,17 @@
 #include <syslog.h>
 #include <pthread.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define PORT 9000
+#if USE_AESD_CHAR_DEVICE
+#define DATA_FILE "/dev/aesdchar"
+#else
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define TIMESTAMP_INTERVAL_SECONDS 10
+#endif
 
 volatile sig_atomic_t exit_requested = 0;
 int server_fd = -1;
@@ -174,6 +182,7 @@ static void *handle_connection(void *arg)
     return NULL;
 }
 
+#if !USE_AESD_CHAR_DEVICE
 static void *timestamp_thread_func(void *arg)
 {
     (void)arg;
@@ -207,6 +216,7 @@ static void *timestamp_thread_func(void *arg)
 
     return NULL;
 }
+#endif
 
 /* Joins and frees any connection threads that have finished, without
  * blocking on ones still in progress. */
@@ -261,8 +271,10 @@ int main(int argc, char *argv[])
         exit(EXIT_FAILURE);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     pthread_t timestamp_tid;
     pthread_create(&timestamp_tid, NULL, timestamp_thread_func, NULL);
+#endif
 
     while (!exit_requested) {
         struct sockaddr_in client_addr;
@@ -312,12 +324,18 @@ int main(int argc, char *argv[])
         free(node);
     }
 
+#if !USE_AESD_CHAR_DEVICE
     pthread_join(timestamp_tid, NULL);
+#endif
 
     if (server_fd != -1) {
         close(server_fd);
     }
+#if !USE_AESD_CHAR_DEVICE
+    /* /dev/aesdchar is a device node managed by the driver, not a regular
+     * file we created - leave it in place on exit. */
     unlink(DATA_FILE);
+#endif
     closelog();
 
     return 0;
