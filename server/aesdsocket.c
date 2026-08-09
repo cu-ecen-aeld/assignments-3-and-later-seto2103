@@ -13,9 +13,14 @@
 #include <arpa/inet.h>
 #include <syslog.h>
 #include <pthread.h>
+#include <sys/ioctl.h>
 
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#include "../aesd-char-driver/aesd_ioctl.h"
 #endif
 
 #define PORT 9000
@@ -136,6 +141,67 @@ static void append_packet_and_reply(const char *packet, size_t packet_len, int c
     pthread_mutex_unlock(&file_mutex);
 }
 
+#if USE_AESD_CHAR_DEVICE
+#define IOCTL_SEEK_PREFIX "AESDCHAR_IOCSEEKTO:"
+
+/* Parses a packet as "AESDCHAR_IOCSEEKTO:X,Y\n" with X/Y unsigned decimal
+ * integers. Returns 1 and fills *seekto on a full match, 0 otherwise. */
+static int try_parse_seekto(const char *packet, size_t packet_len, struct aesd_seekto *seekto)
+{
+    char tmp[64];
+    unsigned int write_cmd, write_cmd_offset;
+    int consumed = 0;
+
+    if (packet_len < 1 || packet[packet_len - 1] != '\n')
+        return 0;
+    if (packet_len - 1 >= sizeof(tmp))
+        return 0;
+
+    memcpy(tmp, packet, packet_len - 1);
+    tmp[packet_len - 1] = '\0';
+
+    if (sscanf(tmp, IOCTL_SEEK_PREFIX "%u,%u%n", &write_cmd, &write_cmd_offset, &consumed) != 2)
+        return 0;
+    if ((size_t)consumed != packet_len - 1)
+        return 0;
+
+    seekto->write_cmd = write_cmd;
+    seekto->write_cmd_offset = write_cmd_offset;
+    return 1;
+}
+
+/* Issues the AESDCHAR_IOCSEEKTO ioctl and reads the reply from the same fd,
+ * so the seeked file position is honored by the read, per assignment 9. */
+static void handle_seekto_and_reply(const struct aesd_seekto *seekto, int client_fd)
+{
+    char send_buf[1024];
+    ssize_t n;
+
+    pthread_mutex_lock(&file_mutex);
+
+    int fd = open(DATA_FILE, O_RDWR);
+    if (fd < 0) {
+        syslog(LOG_ERR, "open failed for ioctl: %s", strerror(errno));
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+
+    if (ioctl(fd, AESDCHAR_IOCSEEKTO, seekto) != 0) {
+        syslog(LOG_ERR, "AESDCHAR_IOCSEEKTO failed: %s", strerror(errno));
+        close(fd);
+        pthread_mutex_unlock(&file_mutex);
+        return;
+    }
+
+    while ((n = read(fd, send_buf, sizeof(send_buf))) > 0) {
+        write_all(client_fd, send_buf, (size_t)n);
+    }
+
+    close(fd);
+    pthread_mutex_unlock(&file_mutex);
+}
+#endif
+
 static void *handle_connection(void *arg)
 {
     struct thread_node *node = (struct thread_node *)arg;
@@ -165,7 +231,16 @@ static void *handle_connection(void *arg)
             recv_buffer[recv_buffer_size++] = c;
 
             if (c == '\n') {
+#if USE_AESD_CHAR_DEVICE
+                struct aesd_seekto seekto;
+                if (try_parse_seekto(recv_buffer, recv_buffer_size, &seekto)) {
+                    handle_seekto_and_reply(&seekto, client_fd);
+                } else {
+                    append_packet_and_reply(recv_buffer, recv_buffer_size, client_fd);
+                }
+#else
                 append_packet_and_reply(recv_buffer, recv_buffer_size, client_fd);
+#endif
                 free(recv_buffer);
                 recv_buffer = NULL;
                 recv_buffer_size = 0;
